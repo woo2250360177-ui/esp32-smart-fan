@@ -3,17 +3,92 @@
 // GPIO33 <- tach yellow, 10k pull-up to 3V3. 12V negative shares GND.
 // DS26, K1=27, IR14, LED21, BEEP25. Two pulses/rev assumed.
 #include <Arduino.h>
+#include <math.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <math.h>
 #include <stdint.h>
 #include <IRremoteESP8266.h>
 #include <IRrecv.h>
 #include <IRutils.h>
+// Display bus timing selected by the user's physical diagnostic.
+namespace TempDisplay {
+constexpr uint8_t clkPin=18, dioPin=19;
+constexpr uint16_t bitUs=500;
+constexpr uint8_t DIGITS[10]={0x3f,0x06,0x5b,0x4f,0x66,0x6d,0x7d,0x07,0x7f,0x6f};
+constexpr uint8_t DASH=0x40;
+bool acknowledged=false;
+char lastAck[10]="000000000";
+uint32_t bootAt=0, updatedAt=0;
+void releaseLine(uint8_t pin){pinMode(pin,INPUT_PULLUP);}
+void pullLow(uint8_t pin){digitalWrite(pin,LOW);pinMode(pin,OUTPUT);}
+void tick(){delayMicroseconds(bitUs);}
+void stopBus(){pullLow(clkPin);pullLow(dioPin);tick();releaseLine(clkPin);tick();releaseLine(dioPin);tick();}
+void startBus(){releaseLine(dioPin);releaseLine(clkPin);tick();pullLow(dioPin);tick();pullLow(clkPin);tick();}
+bool writeByte(uint8_t value){
+  for(uint8_t i=0;i<8;i++){
+    pullLow(clkPin);tick();
+    if(value&1)releaseLine(dioPin);else pullLow(dioPin);
+    tick();releaseLine(clkPin);tick();
+    pullLow(clkPin);tick();value>>=1;
+  }
+  releaseLine(dioPin);tick();releaseLine(clkPin);tick();
+  const bool ack=digitalRead(dioPin)==LOW;
+  pullLow(clkPin);tick();releaseLine(dioPin);tick();
+  return ack;
+}
 
-#include <math.h>
+// 9 ACK results: data command, start address, six display bytes, display-on.
+bool sendFrame(const uint8_t data[6],char result[10]){
+  uint8_t n=0;bool ok=true;
+  startBus();bool a=writeByte(0x40);result[n++]=a?'1':'0';ok &= a;stopBus();
+  startBus();a=writeByte(0xc0);result[n++]=a?'1':'0';ok &= a;
+  for(uint8_t i=0;i<6;i++){a=writeByte(data[i]);result[n++]=a?'1':'0';ok &= a;}
+  stopBus();startBus();a=writeByte(0x8c);result[n++]=a?'1':'0';ok &= a;stopBus();
+  result[n]=0;return ok;
+}
+
+void segments(const uint8_t data[4]){
+  const uint8_t frame[6]={data[0],data[1],data[2],data[3],0,0};
+  acknowledged=sendFrame(frame,lastAck);
+}
+void encode(float temp,bool valid,uint8_t data[4]){
+  for(uint8_t i=0;i<4;++i)data[i]=0;
+  if(!valid || !isfinite(temp) || temp < -55 || temp > 125){
+    for(uint8_t i=0;i<4;++i)data[i]=DASH;
+    return;
+  }
+  int value=(int)lroundf(temp*10.0f);
+  bool negative=value<0;
+  if(negative)value=-value;
+  data[3]=DIGITS[value%10]; value/=10;
+  data[2]=DIGITS[value%10]|0x80; value/=10; // Decimal point before tenths.
+  int pos=1;
+  while(value>0 && pos>=0){data[pos--]=DIGITS[value%10];value/=10;}
+  if(negative && pos>=0)data[pos]=DASH;
+}
+void begin(){
+  releaseLine(clkPin);releaseLine(dioPin);
+  delay(2000); // Power-on settling, only once at boot.
+  stopBus();delay(20);
+  const uint8_t all[4]={0xff,0xff,0xff,0xff};segments(all);
+  bootAt=updatedAt=millis();
+  Serial.printf("DISPLAY init ACK=%d bits=%s (CLK18 DIO19 delay_us=500)\n",acknowledged,lastAck);
+}
+void update(float temp,bool valid){
+  const uint32_t now=millis();
+  if(now-bootAt<1000 || now-updatedAt<1000)return;
+  updatedAt=now;
+  uint8_t data[4];encode(temp,valid,data);
+  const bool before=acknowledged;
+  segments(data);
+  if(before!=acknowledged)
+    Serial.printf("DISPLAY ACK=%d bits=%s\n",acknowledged,lastAck);
+}
+}
+
+
 #include <stdint.h>
 struct TemperatureControl {
   float history[11] = {};
@@ -77,7 +152,7 @@ const char PAGE[] PROGMEM=R"HTML(
 <form action="/control" method="post" target="result"><div class="buttons"><button name="value" value="start">开始新记录</button><button name="value" value="finish">结束记录</button><button name="value" value="clear">清空记录</button></div></form><p><a id="download" class="download" href="/experiment.csv" aria-disabled="true">导出 CSV</a></p>
 <p class="note">开始新记录会清空上次数据；最多 600 个样本，约 10 分钟。到达容量或结束记录后风扇继续工作。数据仅存在 RAM，断电丢失，请先导出。CSV 导出过程中控制响应可能短暂延迟。</p>
 <iframe name="result" id="result" title="设备操作反馈"></iframe></section></div>
-<footer><span id="version">固件 --</span> · 页面 V11 · 无互联网依赖 · 手机断开后设备继续按当前模式运行</footer>
+<footer><span id="version">固件 --</span> · 页面 V11.1 · 无互联网依赖 · 手机断开后设备继续按当前模式运行</footer>
 </main><script>
 var points=[],lastMs=0;
 function el(id){return document.getElementById(id);}
@@ -103,7 +178,7 @@ function show(s){
  el('notice').textContent=alarms.length?alarms.join(' / ')+(s.mode===0?'；当前手动模式，请检查设备':'；自动模式已请求全速'):!s.sampled?'等待首次采样':s.raw===null?'采样暂时无效；自动模式保持之前输出':'监测正常';el('notice').className=alarms.length||s.raw===null?'notice warn':'notice';
  ['minT','maxT'].forEach(function(k){el(k).textContent=s[k]===null?'--':s[k].toFixed(2)+' °C';});el('meanOutput').textContent=s.meanOutput===null?'--':s.meanOutput.toFixed(1)+'%';el('changes').textContent=s.count?s.changes+' 次':'--';
  var reasons={not_started:'尚未开始',recording:'记录中',manual_finish:'已结束',capacity_reached:'已达到容量',user_stop:'用户停止',cleared:'已清空'};
- el('record').textContent='#'+s.experimentId+' · '+(reasons[s.recordEndReason]||s.recordEndReason)+' · '+s.count+'/600';el('progress').value=s.count;el('version').textContent='固件 '+s.firmware;
+ el('record').textContent='#'+s.experimentId+' · '+(reasons[s.recordEndReason]||s.recordEndReason)+' · '+s.count+'/600';el('progress').value=s.count;el('version').textContent='固件 '+s.firmware+' · 数码管 '+(s.displayAck?'已应答':'未应答，请检查接线');
  document.querySelectorAll('button').forEach(function(b){b.classList.remove('active');b.disabled=s.recording&&['manual','threshold','trend','1','2','3','start','clear'].indexOf(b.value)>=0;if(b.value==='finish')b.disabled=!s.recording;});
  el('m'+s.mode).classList.add('active');el('s'+s.level).classList.add('active');el('download').setAttribute('aria-disabled',s.recording||!s.count?'true':'false');
  var p=Object.assign({},s);if(s.raw===null){p.baseline=null;p.trend=null;}points.push(p);if(points.length>180)points.shift();draw('temperature',['raw','filtered','predicted'],false);draw('levels',['level','baseline','trend'],true);
@@ -118,7 +193,7 @@ poll();
 
 )HTML";
 
-const char* FIRMWARE_VERSION="11.0.0-tlc12c";
+const char* FIRMWARE_VERSION="11.2.0-tlc12c-display";
 // Wiring: GPIO32 -> 1k -> NPN base, GPIO33 <- tach, GPIO27 -> K1, GPIO26 -> DS, GPIO14 -> IRED,
 // GPIO21 -> D1, GPIO25 -> BEEP. Keep relay contacts disconnected.
 const int MOTOR=32, BUTTON=27, DS=26, CHANNEL=0;
@@ -330,7 +405,8 @@ void sendStatus(){
   s+=",\"firmware\":\""+String(FIRMWARE_VERSION)+"\",\"schemaVersion\":1";
   s+=",\"experimentId\":"+String(experimentId);
   s+=",\"recordEndReason\":\""+String(recordEndReason)+"\"";
-  s+=",\"rpm\":"+(fanRpm<0?String("null"):String(fanRpm)); 
+  s+=",\"rpm\":"+(fanRpm<0?String("null"):String(fanRpm));
+  s+=",\"displayAck\":"+String(TempDisplay::acknowledged?"true":"false"); 
   int validCount=0, changes=0;float lo=INFINITY,hi=-INFINITY;uint32_t pwmSum=0;
   for(int i=0;i<recordCount;i++){
     const Record& r=records[i];pwmSum+=r.pwm;
@@ -404,6 +480,7 @@ void setup(){
   sensors.requestTemperatures();conversionAt=millis();
   pinMode(TACH_PIN,INPUT_PULLUP); tachAt=millis();
   attachInterrupt(digitalPinToInterrupt(TACH_PIN),countPulse,FALLING);
+  TempDisplay::begin();
   irrecv.enableIRIn();
   WiFi.mode(WIFI_AP);
   if(!WiFi.softAP("ESP32-SmartFan","Fan123456")){
@@ -424,6 +501,8 @@ void loop(){
   handleButton();
   handleInfrared();
   handleMotor();pollTach();
-  handleTemperature();handleIndicators();server.handleClient();
+  handleTemperature();
+  TempDisplay::update(rawTemperature,sampled && ctl.valid);
+  handleIndicators();server.handleClient();
 }
 
