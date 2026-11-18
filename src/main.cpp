@@ -457,6 +457,16 @@ void handleControl(){
   else{server.send(400,"text/plain; charset=utf-8","无效指令");return;}
   server.send(200,"text/plain; charset=utf-8",message);
 }
+// Restrict the unauthenticated HTTP API to ESP32 SoftAP clients.
+// STA campus-network clients cannot read telemetry or control the fan.
+bool requireApClient(){
+  const IPAddress remote=server.client().remoteIP();
+  const IPAddress ap=WiFi.softAPIP();
+  const bool fromAp=(remote[0]==ap[0] && remote[1]==ap[1] && remote[2]==ap[2]);
+  if(!fromAp)server.send(403,"text/plain; charset=utf-8",
+      "Local dashboard only: connect to ESP32-SmartFan Wi-Fi.");
+  return fromAp;
+}
 void setup(){
   Serial.begin(115200);Serial.println(FIRMWARE_VERSION);pinMode(BUTTON,INPUT_PULLUP);
   digitalWrite(STATUS_LED_PIN,LOW);pinMode(STATUS_LED_PIN,OUTPUT);
@@ -469,18 +479,27 @@ void setup(){
   attachInterrupt(digitalPinToInterrupt(TACH_PIN),countPulse,FALLING);
   TempDisplay::begin();
   irrecv.enableIRIn();
-  WiFi.mode(WIFI_AP);
+  // AP+STA: retain the local dashboard and join the university network.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
+  Serial.print("ESP32 STA MAC: ");Serial.println(WiFi.macAddress());
+  Serial.print("ESP32 AP MAC: ");Serial.println(WiFi.softAPmacAddress());
   if(!WiFi.softAP("ESP32-SmartFan","Fan123456")){
-    Serial.println("AP failed; local control available.");return;
+    Serial.println("AP failed; STA connection will still be attempted.");
+  }else{
+    Serial.print("AP started: ");Serial.println(WiFi.softAPIP());
   }
+  Serial.println("Connecting to TJU WLAN...");
+  WiFi.begin("tjuwlan");
   server.on("/",HTTP_GET,[](){
+    if(!requireApClient())return;
     server.sendHeader("Cache-Control","no-store");
     server.send_P(200,"text/html; charset=utf-8",PAGE);
   });
-  server.on("/status",HTTP_GET,sendStatus);
-  server.on("/control",HTTP_POST,handleControl);
-  server.on("/experiment.csv",HTTP_GET,downloadCsv);
-  server.on("/records",HTTP_GET,sendRecords);
+  server.on("/status",HTTP_GET,[](){if(requireApClient())sendStatus();});
+  server.on("/control",HTTP_POST,[](){if(requireApClient())handleControl();});
+  server.on("/experiment.csv",HTTP_GET,[](){if(requireApClient())downloadCsv();});
+  server.on("/records",HTTP_GET,[](){if(requireApClient())sendRecords();});
   server.onNotFound([](){server.send(404,"text/plain","Not found");});
   server.begin();
   Serial.print("TL-C12C integrated test: http://");Serial.println(WiFi.softAPIP());
@@ -491,6 +510,25 @@ void loop(){
   handleMotor();pollTach();
   handleTemperature();
   TempDisplay::update(rawTemperature,sampled && ctl.valid);
-  handleIndicators();server.handleClient();
+  handleIndicators();
+  server.handleClient();
+
+  // Nonblocking connection status: failure never stops automatic control.
+  static bool lastConnected=false;
+  static uint32_t lastLogAt=0;
+  const bool connected=(WiFi.status()==WL_CONNECTED);
+  if(connected && !lastConnected){
+    Serial.println("TJU WLAN CONNECTED!");
+    Serial.print("STA IP: ");Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");Serial.println(WiFi.gatewayIP());
+    Serial.print("RSSI: ");Serial.println(WiFi.RSSI());
+  }else if(!connected && lastConnected){
+    Serial.println("TJU WLAN DISCONNECTED!");
+  }
+  if(!connected && millis()-lastLogAt>=10000){
+    lastLogAt=millis();
+    Serial.printf("Waiting for TJU WLAN, status=%d\n",(int)WiFi.status());
+  }
+  lastConnected=connected;
 }
 
