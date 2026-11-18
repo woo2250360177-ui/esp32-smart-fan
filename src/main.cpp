@@ -390,7 +390,7 @@ void sendRecords(){
   int limit=server.hasArg("limit") ? server.arg("limit").toInt() : 25;
   if(offset<0)offset=0;
   if(limit<1)limit=25;
-  if(limit>50)limit=50;
+  if(limit>25)limit=25;
   String filter=server.arg("filter");
   int total=0;
   for(int i=0;i<recordCount;i++){
@@ -401,7 +401,7 @@ void sendRecords(){
     else if(filter=="hot")match=r.valid && r.raw>=ALARM_HIGH_C;
     if(match)++total;
   }
-  String s;s.reserve(7200);
+  String s;s.reserve(4200);
   s="{\"total\":"+String(total)+",\"offset\":"+String(offset)+",\"limit\":"+String(limit)+",\"items\":[";
   int matched=0,emitted=0;
   for(int i=0;i<recordCount;i++){
