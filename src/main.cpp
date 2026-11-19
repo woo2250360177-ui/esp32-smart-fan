@@ -13,6 +13,7 @@
 #include <IRrecv.h>
 #include <IRutils.h>
 #include "dashboard_page.h"
+#include "cloud_bridge.h"
 // Display bus timing selected by the user's physical diagnostic.
 namespace TempDisplay {
 constexpr uint8_t clkPin=18, dioPin=19;
@@ -131,7 +132,7 @@ struct TemperatureControl {
 
 
 
-const char* FIRMWARE_VERSION="12.0.0-smartfan-iot";
+const char* FIRMWARE_VERSION="13.0.0-smartfan-blynk";
 // Wiring: GPIO32 -> 1k -> NPN base, GPIO33 <- tach, GPIO27 -> K1, GPIO26 -> DS, GPIO14 -> IRED,
 // GPIO21 -> D1, GPIO25 -> BEEP. Keep relay contacts disconnected.
 const int MOTOR=32, BUTTON=27, DS=26, CHANNEL=0;
@@ -433,12 +434,12 @@ void sendRecords(){
   server.send(200,"application/json",s);
 }
 
-void handleControl(){
-  String v=server.arg("value"),message="操作成功";
-  server.sendHeader("Cache-Control","no-store");
-  Serial.println("Web command: "+v);
+struct CommandResult { int status; String message; };
+
+CommandResult dispatchCommand(const String& v){
+  String message="操作成功";
   if(recording && (v=="manual" || v=="threshold" || v=="trend" || v=="1" || v=="2" || v=="3" || v=="clear")){
-    server.send(409,"text/plain; charset=utf-8","请先结束记录，再切换策略、档位或清空数据");return;
+    return {409,"请先结束记录，再切换策略、档位或清空数据"};
   }
   if(v=="indicator_test"){testingIndicators=true;ledBeepAt=millis();message="LED + BEEP test";}
   else if(v=="0"){stopFan();message="已输出0%并结束记录，请观察实际转速";}
@@ -454,15 +455,42 @@ void handleControl(){
     if(recording){recording=false;recordEndReason="manual_finish";}
     message="记录已结束，风扇继续按当前模式工作";
   }else if(v=="clear"){recordCount=0;recordEndReason="cleared";message="记录已清空";}
-  else{server.send(400,"text/plain; charset=utf-8","无效指令");return;}
-  server.send(200,"text/plain; charset=utf-8",message);
+  else return {400,"无效指令"};
+  return {200,message};
+}
+
+void handleControl(){
+  const String command=server.arg("value");
+  Serial.println("Web command: "+command);
+  const CommandResult result=dispatchCommand(command);
+  server.sendHeader("Cache-Control","no-store");
+  server.send(result.status,"text/plain; charset=utf-8",result.message);
+}
+
+void handleCloudCommands(){
+  CloudBridge::Command command;
+  for(int i=0;i<8 && CloudBridge::take(command);++i){
+    if(!CloudBridge::current(command))continue;
+    const char* const values[]={"0","1","2","3","manual","threshold","trend"};
+    const CommandResult result=dispatchCommand(values[command.code]);
+    Serial.printf("[Blynk] %s command=%s mode=%s level=%d\n",
+        result.status==200?"APPLIED":"LOCKED",values[command.code],MODE_NAMES[mode],targetLevel);
+    if(command.code==0)break;
+  }
+}
+
+void publishCloudState(){
+  static uint32_t last=0;
+  const uint32_t now=millis();
+  if(now-last<100)return;
+  last=now;
+  CloudBridge::publish({rawTemperature,fanRpm,(appliedPwm*100+127)/255,
+      static_cast<int>(mode),targetLevel,alarmBits(),sampled && ctl.valid});
 }
 // Restrict the unauthenticated HTTP API to ESP32 SoftAP clients.
 // STA campus-network clients cannot read telemetry or control the fan.
 bool requireApClient(){
-  const IPAddress remote=server.client().remoteIP();
-  const IPAddress ap=WiFi.softAPIP();
-  const bool fromAp=(remote[0]==ap[0] && remote[1]==ap[1] && remote[2]==ap[2]);
+  const bool fromAp=server.client().localIP()==WiFi.softAPIP();
   if(!fromAp)server.send(403,"text/plain; charset=utf-8",
       "Local dashboard only: connect to ESP32-SmartFan Wi-Fi.");
   return fromAp;
@@ -479,18 +507,13 @@ void setup(){
   attachInterrupt(digitalPinToInterrupt(TACH_PIN),countPulse,FALLING);
   TempDisplay::begin();
   irrecv.enableIRIn();
-  // AP+STA: retain the local dashboard and join the university network.
+  // Keep the local dashboard on SoftAP while the cloud task manages STA.
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setAutoReconnect(true);
-  Serial.print("ESP32 STA MAC: ");Serial.println(WiFi.macAddress());
-  Serial.print("ESP32 AP MAC: ");Serial.println(WiFi.softAPmacAddress());
   if(!WiFi.softAP("ESP32-SmartFan","Fan123456")){
     Serial.println("AP failed; STA connection will still be attempted.");
   }else{
     Serial.print("AP started: ");Serial.println(WiFi.softAPIP());
   }
-  Serial.println("Connecting to TJU WLAN...");
-  WiFi.begin("tjuwlan");
   server.on("/",HTTP_GET,[](){
     if(!requireApClient())return;
     server.sendHeader("Cache-Control","no-store");
@@ -502,9 +525,11 @@ void setup(){
   server.on("/records",HTTP_GET,[](){if(requireApClient())sendRecords();});
   server.onNotFound([](){server.send(404,"text/plain","Not found");});
   server.begin();
+  CloudBridge::begin();
   Serial.print("TL-C12C integrated test: http://");Serial.println(WiFi.softAPIP());
 }
 void loop(){
+  handleCloudCommands();
   handleButton();
   handleInfrared();
   handleMotor();pollTach();
@@ -513,22 +538,6 @@ void loop(){
   handleIndicators();
   server.handleClient();
 
-  // Nonblocking connection status: failure never stops automatic control.
-  static bool lastConnected=false;
-  static uint32_t lastLogAt=0;
-  const bool connected=(WiFi.status()==WL_CONNECTED);
-  if(connected && !lastConnected){
-    Serial.println("TJU WLAN CONNECTED!");
-    Serial.print("STA IP: ");Serial.println(WiFi.localIP());
-    Serial.print("Gateway: ");Serial.println(WiFi.gatewayIP());
-    Serial.print("RSSI: ");Serial.println(WiFi.RSSI());
-  }else if(!connected && lastConnected){
-    Serial.println("TJU WLAN DISCONNECTED!");
-  }
-  if(!connected && millis()-lastLogAt>=10000){
-    lastLogAt=millis();
-    Serial.printf("Waiting for TJU WLAN, status=%d\n",(int)WiFi.status());
-  }
-  lastConnected=connected;
+  publishCloudState();
 }
 
