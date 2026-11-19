@@ -25,3 +25,29 @@
 ### 硬件确认
 
 底板引脚、风扇线数/额定电流、驱动模块、温度传感器、屏幕型号均待核对。
+
+
+## 2026-11-18：SmartFan IoT Platform 12.0.0
+
+### 已完成（源码已推送至 feature/smartfan-iot-platform-v12）
+
+- 将原有单页控制网页升级为五个功能区：设备总览、设备控制、实验数据、算法分析、设备诊断。
+- 增加响应式布局、设备状态 KPI、温度/转速/输出曲线。
+- 增加实验数据分页查询 API：GET /records，支持 all、alarm、invalid、hot 筛选。
+- 增加实验数据表格、分页和 CSV 导出入口。
+- 将网页 HTML 独立到 src/dashboard_page.h，同时保留 web/dashboard.html 作为独立源文件。
+- 更新固件版本标识为 12.0.0-smartfan-iot，并更新 README。
+
+### 保留的边界
+
+- 原有 /status、/control、/experiment.csv API 与温控、红外、按键、PWM 逻辑保留。
+- 仍为 ESP32 SoftAP 本地模式；尚未集成 Blynk 或其他云平台。
+- 实验记录仍为最多 600 条 RAM 数据，断电丢失；RPM 仍为估算值。
+- 设备诊断只展示固件当前实际提供的状态，不伪造持久化事件日志。
+
+### 待验证
+
+- 用户本地 PlatformIO Build。
+- 烧录后测试 /、/status、/records、/control、/experiment.csv。
+- 验证五个页面、筛选分页、CSV 导出、手机响应式布局。
+- 实机验证控制策略、风扇转速、温度传感器与报警。
